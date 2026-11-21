@@ -2,8 +2,10 @@ import importlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import ModuleType
 
 import pytest
 import torch
@@ -158,6 +160,12 @@ def test_official_layer(toy: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
             pytest.skip(f"pinned reference unavailable: {error}")
         monkeypatch.syspath_prepend(checkout)
+        # Load the two reference files without the training package's circular imports.
+        for directory in ("modules", "utils"):
+            name = f"quantization.{directory}"
+            package = ModuleType(name)
+            package.__path__ = [str(Path(checkout) / "quantization" / directory)]
+            monkeypatch.setitem(sys.modules, name, package)
         module = importlib.import_module("quantization.modules.littlebit")
         unpacker = importlib.import_module("quantization.utils.binary_packer").binary_unpacker
     official = module.LittleBitLinear()

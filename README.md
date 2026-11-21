@@ -48,7 +48,7 @@ PyTorch headers and libraries from that environment. CMake and a C/C++ compiler 
 
 ```sh
 python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-python -m pip install 'setuptools>=69' wheel ninja
+python -m pip install 'setuptools>=77' wheel ninja
 MAX_JOBS=1 python -m pip install --no-build-isolation -e '.[test]'
 python -m pytest
 ```
@@ -72,8 +72,7 @@ The C ABI in [include/littlebit.h](include/littlebit.h) copies the input weights
 FP32 activations. Use `lb_layer_forward_ex` for per-call kernel and thread settings.
 
 Create a test checkpoint with the original paper's Dual-SVID initialization. The target bit rate is
-rounded to a valid rank. Use `--no-residual` for one path. These checkpoints are for runtime
-verification. Their model quality has not been trained or evaluated.
+rounded to a valid rank. Use `--no-residual` for one path. Use these untrained checkpoints to verify inference correctness.
 
 ```sh
 python tools/make_synthetic.py HuggingFaceTB/SmolLM2-135M checkpoints/sample --eff-bit 0.1
@@ -96,6 +95,38 @@ littlebit-bench --threads 4 --output bench-results/smollm2.json model HuggingFac
 
 Use `--kernel scalar`, `--kernel avx2`, `--kernel avx512`, `--kernel lut` or `--kernel batched`
 to force the packed kernel. The loader accepts the same names via `kernel=`.
+
+### Measured results
+
+Intel Core i7-8550U in Ubuntu under WSL2, 4 threads, kernel `auto`.
+Relevant CPU flags `fma avx f16c bmi1 avx2 bmi2`. The runs used PyTorch `2.10.0+cpu` and
+source commit `2eb4c46479ee`. Each cell shows the median (minimum–maximum)
+of five interleaved samples.
+
+Generation used a ten-token prompt and sixteen new tokens. The packed and unpacked variants
+used the same synthetic weights at a target of 0.1 BPW.
+
+| Model | Variant | New tokens/s | Peak RSS (MiB) |
+|---|---|---:|---:|
+| SmolLM2-135M | Packed | 24.32 (9.42–25.63) | 507.7 (507.5–507.9) |
+| SmolLM2-135M | Unpacked FP32 | 22.68 (18.81–23.06) | 528.8 (528.7–529.2) |
+| SmolLM2-135M | Dense FP32 | 10.61 (9.72–11.07) | 1088.5 (1088.4–1088.6) |
+| SmolLM2-135M | Dense BF16 | 10.52 (9.85–13.65) | 617.8 (617.3–618.9) |
+| Qwen2.5-0.5B | Packed | 9.83 (8.34–10.55) | 1125.4 (1125.3–1125.6) |
+| Qwen2.5-0.5B | Unpacked FP32 | 9.37 (7.94–9.76) | 1297.9 (1297.1–1298.2) |
+| Qwen2.5-0.5B | Dense FP32 | 4.13 (0.77–5.33) | 2970.6 (2376.6–3077.0) |
+| Qwen2.5-0.5B | Dense BF16 | 6.50 (6.13–7.45) | 1386.7 (1386.4–1386.8) |
+
+Example projection latencies in milliseconds. The complete suite covers all projection shapes
+and bit targets listed in the design.
+
+| Model shape | In × out | Target BPW | Rank | Tokens | Packed | Unpacked FP32 | Dense FP32 | Dense BF16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Llama-2-7B | 4096 × 4096 | 0.10 | 80 | 1 | 0.667 (0.639–0.769) | 0.862 (0.779–0.947) | 4.136 (4.114–4.183) | 2.135 (2.102–2.399) |
+| Llama-2-7B | 4096 × 4096 | 0.10 | 80 | 16 | 1.502 (1.242–1.627) | 2.298 (1.664–3.718) | 16.191 (16.050–16.464) | 9.952 (9.056–10.324) |
+| Qwen2.5-0.5B | 896 × 896 | 0.10 | 8 | 1 | 0.061 (0.053–0.089) | 0.068 (0.062–0.073) | 0.223 (0.174–0.260) | 0.235 (0.225–0.238) |
+| Qwen2.5-0.5B | 896 × 896 | 0.10 | 8 | 16 | 0.646 (0.635–0.681) | 0.663 (0.634–0.729) | 0.275 (0.265–0.302) | 0.633 (0.606–0.681) |
+
 
 ## How the kernels work
 
