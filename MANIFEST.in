@@ -1,0 +1,5 @@
+include CMakeLists.txt
+recursive-include include *.h
+recursive-include src *.h *.c *.cpp
+recursive-include tests *.c
+include tools/make_synthetic.py
