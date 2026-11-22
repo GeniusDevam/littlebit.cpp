@@ -143,30 +143,40 @@ void lb_batched(const lb_job *job, size_t tile) {
 }
 
 #if LB_X86
-__attribute__((target("avx2"))) void lb_avx2(const lb_job *job, size_t tile) {
+__attribute__((target("avx2"))) static inline void avx2_tokens(const lb_job *job, size_t tile,
+                                                               size_t first, size_t tokens) {
     const lb_matrix *m = job->matrix;
     const uint8_t *bits = m->data + tile * m->bytes * LB_ROWS;
     const __m256i shifts = _mm256_setr_epi32(31, 30, 29, 28, 27, 26, 25, 24);
     const __m256i sign = _mm256_set1_epi32(INT32_MIN);
-    for (size_t t = 0; t < job->tokens; ++t) {
-        const float *x = job->x + t * m->cols;
-        float *y = job->y + t * m->rows + tile * LB_ROWS;
-        __m256 sum[LB_ROWS];
+    const float *x0 = job->x + first * m->cols;
+    __m256 sum[2][LB_ROWS];
+    for (size_t t = 0; t < tokens; ++t) {
         for (size_t r = 0; r < LB_ROWS; ++r) {
-            sum[r] = _mm256_setzero_ps();
+            sum[t][r] = _mm256_setzero_ps();
         }
-        const size_t full = m->cols / 8 * 8;
-        for (size_t c = 0; c < full; c += 8) {
-            const __m256i v = _mm256_castps_si256(_mm256_loadu_ps(x + c));
-            for (size_t r = 0; r < LB_ROWS; ++r) {
-                const __m256i w = _mm256_set1_epi32(bits[(c / 8) * LB_ROWS + r]);
-                const __m256i mask = _mm256_and_si256(_mm256_sllv_epi32(w, shifts), sign);
-                sum[r] = _mm256_add_ps(sum[r], _mm256_castsi256_ps(_mm256_xor_si256(v, mask)));
+    }
+    const size_t full = m->cols / 8 * 8;
+    for (size_t c = 0; c < full; c += 8) {
+        __m256i inputs[2];
+        for (size_t t = 0; t < tokens; ++t) {
+            inputs[t] = _mm256_castps_si256(_mm256_loadu_ps(x0 + t * m->cols + c));
+        }
+        for (size_t r = 0; r < LB_ROWS; ++r) {
+            const __m256i w = _mm256_set1_epi32(bits[(c / 8) * LB_ROWS + r]);
+            const __m256i mask = _mm256_and_si256(_mm256_sllv_epi32(w, shifts), sign);
+            for (size_t t = 0; t < tokens; ++t) {
+                const __m256 v = _mm256_castsi256_ps(_mm256_xor_si256(inputs[t], mask));
+                sum[t][r] = _mm256_add_ps(sum[t][r], v);
             }
         }
+    }
+    for (size_t t = 0; t < tokens; ++t) {
+        const float *x = x0 + t * m->cols;
+        float *y = job->y + (first + t) * m->rows + tile * LB_ROWS;
         for (size_t r = 0; r < tile_rows(m, tile); ++r) {
             __m128 pair =
-                _mm_add_ps(_mm256_castps256_ps128(sum[r]), _mm256_extractf128_ps(sum[r], 1));
+                _mm_add_ps(_mm256_castps256_ps128(sum[t][r]), _mm256_extractf128_ps(sum[t][r], 1));
             pair = _mm_hadd_ps(pair, pair);
             pair = _mm_hadd_ps(pair, pair);
             float value = _mm_cvtss_f32(pair);
@@ -175,6 +185,16 @@ __attribute__((target("avx2"))) void lb_avx2(const lb_job *job, size_t tile) {
             }
             y[r] = value;
         }
+    }
+}
+
+__attribute__((target("avx2"))) void lb_avx2(const lb_job *job, size_t tile) {
+    size_t t = 0;
+    for (; job->tokens - t >= 2; t += 2) {
+        avx2_tokens(job, tile, t, 2);
+    }
+    if (t < job->tokens) {
+        avx2_tokens(job, tile, t, 1);
     }
 }
 

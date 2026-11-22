@@ -66,7 +66,8 @@ print(tokenizer.decode(model.generate(**inputs, max_new_tokens=8)[0]))
 ```
 
 The loader supports local safetensors, sharded safetensors and tensor-only `model_state.pt` checkpoints.
-It uses FP32 arithmetic in packed layers. Phi-3's split fused projection is outside this revision.
+It uses FP32 arithmetic in packed layers. Pass `dtype=torch.bfloat16` to keep ordinary model
+weights in BF16. Phi-3's split fused projection is outside this revision.
 `LBLinear` can also be created directly from the packed arrays and scales.
 The C ABI in [include/littlebit.h](include/littlebit.h) copies the input weights and accepts token-major
 FP32 activations. Use `lb_layer_forward_ex` for per-call kernel and thread settings.
@@ -98,35 +99,66 @@ to force the packed kernel. The loader accepts the same names via `kernel=`.
 
 ### Measured results
 
-Intel Core i7-8550U in Ubuntu under WSL2, 4 threads, kernel `auto`.
-Relevant CPU flags `fma avx f16c bmi1 avx2 bmi2`. The runs used PyTorch `2.10.0+cpu` and
-source commit `2eb4c46479ee`. Each cell shows the median (minimum–maximum)
-of five interleaved samples.
+Intel Core i7-8550U in Ubuntu under WSL2 with AVX2, PyTorch `2.10.0+cpu` and four
+configured threads. The baseline is `2439fd5`. Values are medians (minimum–maximum)
+over five samples. Generation included a ten-token prompt and sixteen new tokens.
+Packed and unpacked used the same synthetic checkpoint at a target of 0.1 BPW.
 
-Generation used a ten-token prompt and sixteen new tokens. The packed and unpacked variants
-used the same synthetic weights at a target of 0.1 BPW.
+| Model | Variant | Before tok/s | After tok/s | After peak RSS (MiB) |
+|---|---|---:|---:|---:|
+| SmolLM2-135M | Packed | 23.09 (10.25–24.20) | 24.41 (19.09–25.19) | 507.7 (507.5–507.8) |
+| SmolLM2-135M | Unpacked FP32 | 13.80 (11.42–21.17) | 21.29 (19.92–21.39) | 528.7 (528.4–528.9) |
+| SmolLM2-135M | Dense BF16 | 9.45 (7.55–11.97) | 12.07 (11.31–13.22) | 617.5 (617.4–617.6) |
+| Qwen2.5-0.5B | Packed | 8.58 (6.17–10.36) | 12.80 (11.97–13.50) | 1125.4 (1122.5–1125.4) |
+| Qwen2.5-0.5B | Unpacked FP32 | 7.58 (5.98–9.16) | 8.57 (7.06–9.27) | 1297.7 (1297.6–1298.0) |
+| Qwen2.5-0.5B | Dense BF16 | 5.92 (4.19–7.83) | 7.27 (5.65–7.77) | 1386.6 (1378.4–1386.7) |
 
-| Model | Variant | New tokens/s | Peak RSS (MiB) |
-|---|---|---:|---:|
-| SmolLM2-135M | Packed | 24.32 (9.42–25.63) | 507.7 (507.5–507.9) |
-| SmolLM2-135M | Unpacked FP32 | 22.68 (18.81–23.06) | 528.8 (528.7–529.2) |
-| SmolLM2-135M | Dense FP32 | 10.61 (9.72–11.07) | 1088.5 (1088.4–1088.6) |
-| SmolLM2-135M | Dense BF16 | 10.52 (9.85–13.65) | 617.8 (617.3–618.9) |
-| Qwen2.5-0.5B | Packed | 9.83 (8.34–10.55) | 1125.4 (1125.3–1125.6) |
-| Qwen2.5-0.5B | Unpacked FP32 | 9.37 (7.94–9.76) | 1297.9 (1297.1–1298.2) |
-| Qwen2.5-0.5B | Dense FP32 | 4.13 (0.77–5.33) | 2970.6 (2376.6–3077.0) |
-| Qwen2.5-0.5B | Dense BF16 | 6.50 (6.13–7.45) | 1386.7 (1386.4–1386.8) |
+Example projection latencies in milliseconds. The packed and unpacked variants include
+both sign stages per path, plus scaling and call overhead.
 
-Example projection latencies in milliseconds. The complete suite covers all projection shapes
-and bit targets listed in the design.
+| In × out | Target BPW | Rank | Tokens | Packed before | Packed after | Unpacked FP32 after | Dense BF16 after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 896 × 896 | 0.55 | 104 | 1 | 0.671 (0.640–0.685) | 0.088 (0.082–0.098) | 0.721 (0.686–0.735) | 0.194 (0.184–0.213) |
+| 896 × 896 | 0.10 | 8 | 16 | 0.697 (0.656–0.751) | 0.164 (0.156–0.217) | 0.720 (0.669–0.778) | 0.657 (0.616–0.802) |
+| 4096 × 4096 | 0.10 | 80 | 1 | 0.999 (0.945–1.070) | 0.205 (0.182–0.242) | 0.814 (0.784–0.904) | 2.118 (2.072–2.183) |
+| 4096 × 4096 | 0.10 | 80 | 16 | 2.600 (2.137–4.120) | 1.307 (1.107–1.716) | 2.391 (1.748–3.083) | 13.088 (10.226–15.715) |
+| 11008 × 4096 | 1.00 | 1472 | 16 | 34.138 (29.234–42.419) | 17.002 (15.601–18.079) | 17.983 (17.225–19.044) | 33.286 (29.279–39.138) |
+| 11008 × 4096 | 0.55 | 800 | 16 | 27.871 (20.584–44.778) | 8.609 (8.203–10.014) | 10.672 (10.129–12.061) | 36.775 (33.034–42.060) |
+| 4096 × 11008 | 1.00 | 1472 | 16 | 28.492 (24.320–42.736) | 18.983 (14.800–19.297) | 21.365 (19.918–24.432) | 37.008 (33.898–48.726) |
 
-| Model shape | In × out | Target BPW | Rank | Tokens | Packed | Unpacked FP32 | Dense FP32 | Dense BF16 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Llama-2-7B | 4096 × 4096 | 0.10 | 80 | 1 | 0.667 (0.639–0.769) | 0.862 (0.779–0.947) | 4.136 (4.114–4.183) | 2.135 (2.102–2.399) |
-| Llama-2-7B | 4096 × 4096 | 0.10 | 80 | 16 | 1.502 (1.242–1.627) | 2.298 (1.664–3.718) | 16.191 (16.050–16.464) | 9.952 (9.056–10.324) |
-| Qwen2.5-0.5B | 896 × 896 | 0.10 | 8 | 1 | 0.061 (0.053–0.089) | 0.068 (0.062–0.073) | 0.223 (0.174–0.260) | 0.235 (0.225–0.238) |
-| Qwen2.5-0.5B | 896 × 896 | 0.10 | 8 | 16 | 0.646 (0.635–0.681) | 0.663 (0.634–0.729) | 0.275 (0.265–0.302) | 0.633 (0.606–0.681) |
+A four-thread empty dispatch took 0.175 ms. For the one-token, rank-104
+`V` stage at width 896, automatic dispatch went from 0.197 ms
+to 0.010 ms by selecting one thread. AVX2 prefill reuses each sign mask
+across a pair of tokens.
 
+### Trained Qwen3-8B checkpoint
+
+[LittleBitLLM/littlebit-qwen3-8b-0.55bpw, revision `6b2c47a`](https://huggingface.co/LittleBitLLM/littlebit-qwen3-8b-0.55bpw/tree/6b2c47aa9707e624e2e737d16d64a66be8090ae9)
+is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
+The checkpoint remains local and is not redistributed. The run used `load_pretrained`
+with `dtype=torch.bfloat16`, retaining the separate embedding and output tables in BF16.
+
+These CPU runs used the laptop above with 3.8 GiB of WSL RAM and 1.0 GiB of swap.
+Peak RSS was 1.24 GiB to load, 2.48 GiB during the throughput run and 2.81 GiB
+during perplexity. The perplexity values are cumulative after each 2,048-token WikiText-2
+window, using the same token IDs and second-half scoring rule as littlebit-gguf r3.
+Measured window times ranged from 6.9 to 9.5 minutes.
+
+| Runtime and table format | Window 1 | Window 2 | Window 3 | Window 4 |
+|---|---:|---:|---:|---:|
+| littlebit.cpp, BF16 | 23.4962 | 25.9472 | 27.8435 | 26.2756 |
+| littlebit-gguf r3, F16 | 23.4913 | 25.9303 | 27.8360 | 26.2586 |
+
+Throughput is mean ± sample standard deviation over five repetitions. Prefill starts with
+a fresh cache. Generation starts with one input token and produces 32 new tokens greedily.
+The GGUF measurements use llama-bench, whose benchmark inputs and timing boundaries differ.
+[Littlebit-gguf r3](https://github.com/GeniusDevam/littlebit-gguf/tree/r3)
+
+| Runtime and table format | Prefill 128 (tok/s) | Generation 32 (tok/s) |
+|---|---:|---:|
+| littlebit.cpp, BF16 | 7.71 ± 0.74 | 2.22 ± 0.16 |
+| littlebit-gguf r3, Q4_K / Q6_K | 8.47 ± 1.52 | 5.11 ± 1.60 |
+| littlebit-gguf r3, F16 | 5.04 ± 2.46 | 4.80 ± 0.42 |
 
 ## How the kernels work
 
@@ -136,10 +168,13 @@ Each LittleBit layer is two stages: a sign matrix of shape `r × in` followed by
 s · x  =  Σ x  −  2 · Σ_{j : s_j = −1} x_j
 ```
 
-So a dot product is a sum plus a masked sum. Two strategies are implemented and picked per shape:
+Automatic dispatch times the supported kernels and compares one thread with the configured
+thread count. It caches the choice per stage shape and samples at most 16 tokens during tuning.
+The scalar kernel is available as a reference. The other kernels use the following approaches.
 
 - **sign-flip SIMD**: expand weight bits into lane masks and flip the sign bit of the activations, then accumulate (AVX2 and AVX-512F).
 - **lookup tables**: precompute partial sums for small groups of activations and index them with the weight bits, the approach popularised by T-MAC and bitnet.cpp.
+- **blocked prefill**: expand a small tile of weights to integer signs and reuse it across several tokens.
 
 Details, layouts and the test plan are in [docs/DESIGN.md](docs/DESIGN.md).
 

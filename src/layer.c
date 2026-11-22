@@ -174,6 +174,7 @@ typedef struct {
     size_t rows, cols, tokens;
     unsigned threads;
     lb_kernel kernel;
+    unsigned selected_threads;
 } lb_choice;
 
 static lb_choice choices[128];
@@ -186,41 +187,53 @@ static double now(void) {
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 
-static lb_kernel tune(lb_job *job, unsigned threads) {
+static lb_choice tune(const lb_job *job, unsigned threads) {
     const size_t rows = job->matrix->rows;
     const size_t cols = job->matrix->cols;
-    const size_t tokens = job->tokens;
+    // Bound first-use work and share the choice among long prompts.
+    lb_job sample = *job;
+    if (sample.tokens > 16) {
+        sample.tokens = 16;
+    }
+    const size_t tokens = sample.tokens;
     pthread_mutex_lock(&tune_lock);
     for (size_t i = 0; i < sizeof(choices) / sizeof(choices[0]); ++i) {
         const lb_choice *choice = choices + i;
         if (choice->rows == rows && choice->cols == cols && choice->tokens == tokens &&
             choice->threads == threads) {
-            const lb_kernel selected = choice->kernel;
+            const lb_choice selected = *choice;
             pthread_mutex_unlock(&tune_lock);
             return selected;
         }
     }
-    lb_kernel fastest = LB_BATCHED;
+    lb_choice fastest = {rows, cols, tokens, threads, LB_BATCHED, threads};
     double best = -1;
+    const unsigned counts[] = {1, threads};
+    const size_t count_options = 1 + (threads > 1);
     for (lb_kernel k = LB_AVX2; k <= LB_BATCHED; ++k) {
         if (!lb_kernel_available(k) || (k == LB_BATCHED && tokens == 1 && best >= 0)) {
             continue;
         }
-        // Warm up the worker pool and time the full stage, including lookup-table construction.
-        if (matmul(job, k, threads) != LB_OK) {
-            continue;
-        }
-        const double start = now();
-        if (matmul(job, k, threads) != LB_OK) {
-            continue;
-        }
-        const double elapsed = now() - start;
-        if (best < 0 || elapsed < best) {
-            best = elapsed;
-            fastest = k;
+        for (size_t i = 0; i < count_options; ++i) {
+            const unsigned count = counts[i];
+            if (matmul(&sample, k, count) != LB_OK) {
+                continue;
+            }
+            for (int trial = 0; trial < 3; ++trial) {
+                const double start = now();
+                if (matmul(&sample, k, count) != LB_OK) {
+                    break;
+                }
+                const double elapsed = now() - start;
+                if (best < 0 || elapsed < best) {
+                    best = elapsed;
+                    fastest.kernel = k;
+                    fastest.selected_threads = count;
+                }
+            }
         }
     }
-    choices[next_choice] = (lb_choice){rows, cols, tokens, threads, fastest};
+    choices[next_choice] = fastest;
     next_choice = (next_choice + 1) % (sizeof(choices) / sizeof(choices[0]));
     pthread_mutex_unlock(&tune_lock);
     return fastest;
@@ -231,7 +244,9 @@ static lb_status stage(lb_job *job, lb_kernel kernel, unsigned threads) {
         if ((double)job->matrix->rows * job->matrix->cols * job->tokens < 65536) {
             threads = 1;
         }
-        kernel = tune(job, threads);
+        const lb_choice choice = tune(job, threads);
+        kernel = choice.kernel;
+        threads = choice.selected_threads;
         const lb_status status = matmul(job, kernel, threads);
         if (kernel == LB_LUT && status == LB_NOMEM) {
             return matmul(job, LB_BATCHED, threads);

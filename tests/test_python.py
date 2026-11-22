@@ -10,7 +10,7 @@ from types import ModuleType
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen2Config, Qwen2ForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 from littlebit import LBLinear, load_pretrained
 from littlebit.checkpoint import read_checkpoint
@@ -110,6 +110,40 @@ def test_load_and_generate(toy: Path, layout: str) -> None:
     generated = model.generate(input_ids, min_new_tokens=2, max_new_tokens=2)
     assert generated.shape == (1, 6)
     assert torch.equal(generated[:, :4], input_ids)
+
+
+@torch.inference_mode()
+def test_load_bf16_untied_tables(tmp_path: Path) -> None:
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=24,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        tie_word_embeddings=False,
+        pad_token_id=0,
+        eos_token_id=2,
+    )
+    path = tmp_path / "untied"
+    write_checkpoint(Qwen3ForCausalLM(config).bfloat16(), path, 1.0, True)
+    model = load_pretrained(path, dtype=torch.bfloat16)
+    state = load_file(path / "model.safetensors")
+    for weight, key in (
+        (model.get_input_embeddings().weight, "model.embed_tokens.weight"),
+        (model.get_output_embeddings().weight, "lm_head.weight"),
+    ):
+        assert weight.dtype == torch.bfloat16
+        torch.testing.assert_close(weight, state[key], rtol=0, atol=0)
+    assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
+    assert isinstance(model.model.layers[0].self_attn.q_proj, LBLinear)
+    ids = torch.tensor([[1, 3, 4, 5]])
+    assert torch.isfinite(model(ids).logits).all()
+    generated = model.generate(
+        ids, attention_mask=torch.ones_like(ids), min_new_tokens=2, max_new_tokens=2
+    )
+    assert generated.shape == (1, 6)
 
 
 def test_malformed_shape(toy: Path) -> None:

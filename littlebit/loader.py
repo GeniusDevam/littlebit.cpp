@@ -108,8 +108,11 @@ def _load(
     threads: int,
     reference_dtype: torch.dtype | None,
     quantization: dict[str, Any] | None,
+    dtype: torch.dtype,
 ) -> PreTrainedModel:
     kernel_index(kernel, threads)
+    if dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("dtype must be float32, float16 or bfloat16")
     path = Path(path).resolve()
     checkpoint = read_checkpoint(path, quantization)
     config = AutoConfig.from_pretrained(path, local_files_only=True)
@@ -122,7 +125,7 @@ def _load(
     )
     options = {
         "config": config,
-        "dtype": torch.float32,
+        "dtype": dtype,
         "local_files_only": True,
         "output_loading_info": True,
     }
@@ -149,10 +152,11 @@ def load_pretrained(
     kernel: str = "auto",
     threads: int = 1,
     quantization: dict[str, Any] | None = None,
+    dtype: torch.dtype = torch.float32,
 ) -> PreTrainedModel:
-    """Load a local LittleBit causal language model for CPU generation."""
-    return _load(path, kernel, threads, None, quantization)
+    """Load a local LittleBit CPU model with ordinary weights in dtype."""
+    return _load(path, kernel, threads, None, quantization, dtype)
 
 
 def load_reference(path: str | Path, *, dtype: torch.dtype = torch.float32) -> PreTrainedModel:
-    return _load(path, "auto", 1, dtype, None)
+    return _load(path, "auto", 1, dtype, None, torch.float32)
